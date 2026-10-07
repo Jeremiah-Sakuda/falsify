@@ -1,0 +1,152 @@
+# Trial flow — the core loop. Falsifier and Advocate are components of ONE
+# flow, not two flows that signal each other, because a trigger must be
+# performed by a human user and a flow cannot fire one.
+#
+# SCHEMA NOT YET VALIDATED. The `human_input` component type and the
+# `fixed_parameters` tool binding are the two load-bearing unknowns
+# (planning/oct-9-questions.md, Q1 and Q2). If `human_input` turns out to be
+# chat-only, the fallback is: each gate ends the flow, and a human action
+# triggers the next one.
+#
+# Trigger: assign reviewer.
+
+version: v1
+name: falsify-trial
+description: >
+  Conjecture how this merge request could fail, write one pytest experiment
+  per authorized conjecture, run them in the sandboxed job, then propose a
+  remedy or contest each refutation. The human rules at both pauses.
+
+triggers:
+  - type: assign_reviewer
+    on: merge_request
+
+inputs:
+  mr_iid:
+    type: string
+    from: trigger.merge_request.iid
+  scratch_branch:
+    type: string
+    value: "falsify/mr-${mr_iid}"
+
+components:
+
+  # ---- 1. Conjecture -------------------------------------------------------
+  - id: falsifier_conjecture
+    type: agent
+    prompt_file: ../../../.falsify/prompts/falsifier.md
+    inputs:
+      diff: mr.diff
+      claims: mr.linked_issue.approved_claims     # the Gate 1 comment
+      base_tests: repository.tests.file_list
+    toolset:
+      - gitlab.merge_request.read
+      - gitlab.merge_request.diff.read
+      - gitlab.repository.files.read
+      - gitlab.pipeline.read
+      - gitlab.security_report.read
+    output_schema:
+      conjectures:
+        - id: string                  # X1..X5
+          target: string              # "C2" or "app/deadlines.py:41"
+          conjecture: string          # how the change could fail
+          experiment_summary: string  # what the test will assert
+          estimated_runtime_s: number
+    constraints:
+      max_conjectures: 5
+      prefer_kinds: [boundary, concurrency, spec_violation]
+
+  # ---- 2. Gate 2 -----------------------------------------------------------
+  - id: gate_2
+    type: human_input
+    prompt: >
+      Authorize up to five pytest files under .falsify/experiments/ on the
+      scratch branch, to be run in the sandboxed job. Reply `falsify: approve
+      all`, or strike any by number with `falsify: strike X<N>`.
+    accepts:
+      - "falsify: approve all"
+      - "falsify: strike X<N>"
+    requires_role: maintainer
+    # This authorizes a BOUNDED OPERATION, not code that does not yet exist.
+    # The exact files are reviewable afterward by digest in the certificate,
+    # and the human can still strike any at Gate 3.
+
+  # ---- 3. Write experiments, then start an MR pipeline ---------------------
+  - id: falsifier_write
+    type: agent
+    prompt_file: ../../../.falsify/prompts/falsifier_write.md
+    inputs:
+      authorized: gate_2.approved_ids
+    toolset:
+      - gitlab.repository.files.read
+      - gitlab.merge_request.diff.read
+      - gitlab.repository.files.write:
+          # The model MUST NOT be able to choose the branch or the path root.
+          # Pending Q2. Layer 3 (the experiments job rejecting any diff outside
+          # .falsify/) holds regardless of whether this binding is supported.
+          fixed_parameters:
+            branch: "${scratch_branch}"
+            path_prefix: ".falsify/experiments/"
+      - gitlab.pipeline.create:
+          fixed_parameters:
+            target: merge_request      # an MR pipeline, not a branch pipeline
+            mr_iid: "${mr_iid}"
+      - gitlab.pipeline.read
+    writes:
+      - ".falsify/experiments/<id>_test.py"   # one per authorized conjecture
+    then:
+      # A scratch push does not re-run the MR pipeline on its own, so the
+      # component starts one and polls until `experiments` finishes. Pending
+      # Q3: if the API call is unavailable from inside a flow, fall back to a
+      # pipeline trigger token held by the flow; if neither, the human starts
+      # it (one more small human action, Assisted claim unaffected).
+      - start_mr_pipeline
+      - poll_until: "job:experiments completed"
+        timeout_s: 1800
+
+  # ---- 4. Advocate ---------------------------------------------------------
+  - id: advocate
+    type: agent
+    prompt_file: ../../../.falsify/prompts/advocate.md
+    inputs:
+      experiments: artifact("experiments", "experiments.json")
+      diff: mr.diff
+      claims: mr.linked_issue.approved_claims
+    toolset:
+      - gitlab.merge_request.read
+      - gitlab.merge_request.diff.read
+      - gitlab.repository.files.read
+      - gitlab.merge_request.suggestion.create   # diff lines only; cannot create a file
+      - gitlab.merge_request.comment.create
+    output_schema:
+      rulings_requested:
+        - experiment_id: string
+          kind: string                # remedy | contest
+          suggestion_lines: string    # remedy only; must exist in the diff
+          reasoning: string           # contest only
+
+  # ---- 5. Gate 3 -----------------------------------------------------------
+  - id: gate_3
+    type: human_input
+    prompt: >
+      Rule per finding. Apply a suggestion to accept a remedy, or reply
+      `falsify: sustain X<N>` / `falsify: overrule X<N>` to a contest.
+    accepts:
+      - "falsify: sustain X<N>"
+      - "falsify: overrule X<N>"
+      - "falsify: accept-risk S<N> <reason>"
+      - apply_suggestion
+    requires_role: maintainer
+    then:
+      # A CI job does not change its result when someone replies to a thread,
+      # so a new MR pipeline runs and ITS certificate job reads the rulings.
+      - start_mr_pipeline
+
+  # ---- 6. Summary and exit ------------------------------------------------
+  - id: summary
+    type: agent
+    toolset:
+      - gitlab.merge_request.comment.create
+    template: ../../../.falsify/templates/trial_summary.md
+    # Open refutations remain visible on the MR. Re-running the flow after
+    # fixes re-enters at falsifier_write for the OPEN SET ONLY.

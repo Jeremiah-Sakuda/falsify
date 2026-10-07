@@ -1,0 +1,328 @@
+# Falsify pipeline. Stages line up with the nine lifecycle stages.
+#
+# The one rule, as mechanism: no functional defect claim exists outside
+# `experiments.json`, and nothing merges without `certificate` passing.
+#
+# Trust boundary: Falsify distrusts the MR; the infrastructure distrusts
+# Falsify. See docs/controls.md.
+
+stages:
+  - verify      # base-tests, experiments, promote
+  - secure      # SAST, dependency scanning, secret detection
+  - govern      # certificate (MR), certificate-verify + ledger-commit (main)
+  - package     # build
+  - release     # deploy-staging, deploy-prod, rollback
+  - monitor     # live-experiments, prod-watch
+
+default:
+  image: python:3.12-slim
+  interruptible: true
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHONDONTWRITEBYTECODE: "1"
+  SCRATCH_BRANCH: "falsify/mr-$CI_MERGE_REQUEST_IID"
+  GIT_DEPTH: "50"
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Dependency-Scanning.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+.python:
+  cache:
+    key:
+      files: [requirements.txt, requirements-dev.txt]
+    paths: [.cache/pip]
+  before_script:
+    - pip install --quiet -r requirements.txt -r requirements-dev.txt
+
+# ---------------------------------------------------------------------------
+# verify
+# ---------------------------------------------------------------------------
+
+base-tests:
+  stage: verify
+  extends: .python
+  script:
+    - pytest tests/ --junitxml=junit.xml --cov=app --cov-report=xml --cov-report=term
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths: [junit.xml, coverage.xml]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+experiments:
+  stage: verify
+  extends: .python
+  needs: [base-tests]
+  variables:
+    GIT_DEPTH: "0"          # the harness needs the merge base
+  script:
+    # --- Control 2, layer 3. Before anything executes. -------------------
+    - git fetch --no-tags origin "$SCRATCH_BRANCH" || { echo "no scratch branch; nothing to run"; exit 0; }
+    - git fetch --no-tags origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - BASE=$(git merge-base "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" "$CI_COMMIT_SHA")
+    - ./scripts/check_scratch_scope.sh "origin/$SCRATCH_BRANCH" "$BASE"
+
+    # --- Fetch the experiments into the workspace (not onto the branch) --
+    - rm -rf .falsify/experiments && mkdir -p .falsify/experiments
+    - git checkout "origin/$SCRATCH_BRANCH" -- .falsify/experiments/ || true
+    - ls -la .falsify/experiments/
+
+    # --- Run inside the execution boundary (Control 1) -------------------
+    # run_experiments.py prepares checkouts in this trusted shell, then
+    # executes pytest in a child process with a scrubbed environment.
+    - pip install --quiet pyyaml pytest-timeout
+    - python -m scripts.run_experiments
+        --experiments .falsify/experiments
+        --head "$CI_COMMIT_SHA"
+        --base "$BASE"
+        --out experiments.json
+  artifacts:
+    when: always
+    paths: [experiments.json]
+    expire_in: 90 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+promote:
+  stage: verify
+  extends: .python
+  needs: [experiments]
+  when: manual            # HUMAN-RUN. Never automatic.
+  allow_failure: false
+  variables:
+    EXPERIMENT_ID: ""     # set by the human when running the job
+  script:
+    - test -n "$EXPERIMENT_ID" || { echo "set EXPERIMENT_ID, e.g. X2" >&2; exit 1; }
+    - ./scripts/promote.sh "$EXPERIMENT_ID"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+controls:
+  stage: verify
+  extends: .python
+  script:
+    # The negative tests. Each proves a control fails closed.
+    - pytest .falsify/controls/ -v -m "" || true
+    - echo "Control probes are informational here; the enforcing path is the"
+    - echo "experiments job's own child environment. See docs/controls.md."
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [.falsify/controls/**/*, scripts/run_experiments.py]
+
+# ---------------------------------------------------------------------------
+# govern
+# ---------------------------------------------------------------------------
+
+certificate:
+  stage: govern
+  extends: .python
+  needs:
+    - job: experiments
+      artifacts: true
+    - job: base-tests
+      artifacts: true
+  script:
+    # Fetches Gate 1 / Gate 2 / Gate 3 state from the API into state.json,
+    # then certifies. Blocks merge on an unresolved finding, a missing
+    # promotion, or a stale Gate 2.
+    - pip install --quiet pyyaml
+    - python -m scripts.gitlab_state --mr-iid "$CI_MERGE_REQUEST_IID" --out state.json
+    - python -m scripts.certificate
+        --experiments experiments.json
+        --state state.json
+        --out certificate.md
+  artifacts:
+    when: always
+    paths: [certificate.md, certificate.sha256]
+    expire_in: never
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+certificate-verify:
+  stage: govern
+  extends: .python
+  script:
+    # Confirms the merge commit's tree matches the certified head (or a
+    # documented merge of it), and that all promoted files are present with
+    # their recorded hashes. The main pipeline cannot proceed without this.
+    - python -m scripts.certificate_verify --commit "$CI_COMMIT_SHA"
+  artifacts:
+    paths: [certificate.md]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+ledger-commit:
+  stage: govern
+  extends: .python
+  needs: [certificate-verify]
+  script:
+    - MR_IID=$(python -m scripts.gitlab_state --merged-mr-for "$CI_COMMIT_SHA")
+    - python -m scripts.ledger commit --mr-iid "$MR_IID" --certificate certificate.md
+    - python -m scripts.ledger index
+    - git config user.name "falsify-ledger"
+    - git config user.email "ledger@falsify.invalid"
+    - git add ledger/ LEDGER.md
+    - git commit -m "ledger: certify MR !$MR_IID [skip ci]" || echo "nothing to commit"
+    - git push "https://ledger:${FALSIFY_PROMOTE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:$CI_DEFAULT_BRANCH"
+    # The scratch branch's job is done.
+    - git push "https://ledger:${FALSIFY_PROMOTE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" --delete "falsify/mr-$MR_IID" || true
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ---------------------------------------------------------------------------
+# package
+# ---------------------------------------------------------------------------
+
+build:
+  stage: package
+  image: gcr.io/kaniko-project/executor:debug
+  needs:
+    - job: certificate
+      optional: true
+    - job: ledger-commit
+      optional: true
+  script:
+    - CERT_HASH=$(cat certificate.sha256 2>/dev/null | cut -c1-12 || echo "nocert")
+    - TAG="${CI_COMMIT_SHORT_SHA}-${CERT_HASH}"
+    - echo "building $TAG"
+    - /kaniko/executor
+        --context "$CI_PROJECT_DIR"
+        --dockerfile "$CI_PROJECT_DIR/Dockerfile"
+        --destination "$CI_REGISTRY_IMAGE:$TAG"
+        --destination "${ARTIFACT_REGISTRY}/falsify:$TAG"
+        --digest-file image.digest
+    - echo "$TAG" > image.tag
+  artifacts:
+    paths: [image.digest, image.tag]
+    expire_in: never
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ---------------------------------------------------------------------------
+# release
+# ---------------------------------------------------------------------------
+
+.gcp-oidc:
+  # No stored cloud secrets. The WIF attribute condition requires this
+  # project path AND the protected-environment claim, so a job on a scratch
+  # or MR branch gets no cloud identity at all. (Control 5)
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: https://iam.googleapis.com/$GCP_WIF_PROVIDER
+  before_script:
+    - ./deploy/auth.sh
+
+deploy-staging:
+  stage: release
+  image: google/cloud-sdk:slim
+  extends: .gcp-oidc
+  needs: [build]
+  when: manual              # HUMAN-RUN, on the MR, before Gate 4.
+  environment:
+    name: staging
+    url: $STAGING_URL
+  script:
+    - ./deploy/deploy.sh staging "$(cat image.digest)"
+  artifacts:
+    paths: [staging.url]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+deploy-prod:
+  stage: release
+  image: google/cloud-sdk:slim
+  extends: .gcp-oidc
+  needs: [build, ledger-commit]
+  when: manual              # Native deployment approval, THEN the human starts it.
+  environment:
+    name: production        # protected; requires deployment approval
+    url: $PRODUCTION_URL
+  script:
+    - ./deploy/deploy.sh production "$(cat image.digest)"
+    - MR_IID=$(python -m scripts.gitlab_state --merged-mr-for "$CI_COMMIT_SHA")
+    - python -m scripts.ledger event
+        --mr-iid "$MR_IID" --event deploy-prod
+        --detail "digest $(cat image.digest)"
+        --identity "@${GITLAB_USER_LOGIN}"
+        --cert-hash "$(cat certificate.sha256)"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+rollback:
+  stage: release
+  image: google/cloud-sdk:slim
+  extends: .gcp-oidc
+  when: manual
+  environment:
+    name: production
+    action: prepare
+  script:
+    - ./deploy/rollback.sh production
+    - MR_IID=$(python -m scripts.gitlab_state --merged-mr-for "$CI_COMMIT_SHA")
+    - python -m scripts.ledger event
+        --mr-iid "$MR_IID" --event rollback
+        --detail "traffic routed to the previous revision"
+        --identity "@${GITLAB_USER_LOGIN}"
+        --cert-hash "$(cat certificate.sha256)"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ---------------------------------------------------------------------------
+# monitor
+# ---------------------------------------------------------------------------
+
+live-experiments:
+  stage: monitor
+  extends: .python
+  needs: [deploy-staging, experiments]
+  script:
+    # A DIFFERENT boundary from the experiments job: exactly one permitted
+    # destination, the staging URL, and nothing else. Rate-limited, with the
+    # thresholds committed so the demo is reproducible. (Control 7)
+    - python -m scripts.live_experiments
+        --host "$STAGING_URL"
+        --experiments experiments.json
+        --thresholds .falsify/thresholds.yaml
+        --out live.json
+  artifacts:
+    when: always
+    paths: [live.json]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+prod-watch:
+  stage: monitor
+  image: google/cloud-sdk:slim
+  extends: .gcp-oidc
+  needs: [deploy-prod]
+  timeout: 20 minutes
+  script:
+    # Verifies the live revision's digest FIRST. A mismatch is a hard
+    # failure, not a motion.
+    - python -m scripts.prod_watch
+        --expect-digest "$(cat image.digest)"
+        --thresholds .falsify/thresholds.yaml
+        --out watch.json
+    - MR_IID=$(python -m scripts.gitlab_state --merged-mr-for "$CI_COMMIT_SHA")
+    - python -m scripts.ledger event
+        --mr-iid "$MR_IID" --event watch
+        --detail "$(python -c 'import json;d=json.load(open("watch.json"));print(d["summary"])')"
+        --identity "prod-watch (CI)"
+        --cert-hash "$(cat certificate.sha256)"
+  artifacts:
+    when: always
+    paths: [watch.json]
+    expire_in: never
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

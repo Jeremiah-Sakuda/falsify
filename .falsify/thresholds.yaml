@@ -1,0 +1,40 @@
+# Committed thresholds. The demo must be reproducible on the day of filming,
+# so these are version-controlled rather than chosen at watch time.
+#
+# Frozen with the prompts at the Oct 22 tag. Changing a number after the
+# freeze invalidates the evaluation.
+
+experiments:
+  job_timeout_s: 600          # 10 minutes, whole job
+  per_test_timeout_s: 30
+  head_runs: 2                # a FAIL must reproduce
+  base_runs: 1
+  max_experiments: 5
+  rewrite_attempts: 1         # one rewrite per ERROR, then discard
+  rlimit_as_mb: 1024
+  rlimit_nproc: 64
+
+live_experiments:
+  # Exactly one permitted destination. Rate-limited so staging stays usable.
+  permitted_host_env: FALSIFY_STAGING_HOST
+  requests_per_second: 2
+  duration_s: 60
+  flag_states: [off, on]
+
+prod_watch:
+  duration_s: 600             # 10 minutes
+  sample_interval_s: 15
+  replay_requests_per_second: 20
+  thresholds:
+    error_rate: 0.01          # 1% of requests in the window
+    p95_latency_ms: 800
+  # prod-watch verifies the live revision's image digest against events.md
+  # before sampling. A digest mismatch is a hard failure, not a motion.
+  require_digest_match: true
+
+motion:
+  max_per_deploy: 1
+  caveat: >
+    This is an observation in a ten-minute window following the deploy. It
+    supports a response. It does not by itself attribute cause to this merge
+    request.

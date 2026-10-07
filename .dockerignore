@@ -1,0 +1,14 @@
+planning/
+.git/
+.github/
+.venv/
+__pycache__/
+.pytest_cache/
+tests/
+docs/
+video/
+evaluation/
+ledger/
+.falsify/experiments/
+*.db
+*.sqlite*

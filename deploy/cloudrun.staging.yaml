@@ -1,0 +1,34 @@
+# Staging. Scales to zero — it only needs to answer during a human-run
+# deploy-staging job and the live-experiments replay that follows it.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: falsify-staging
+  labels:
+    falsify-environment: staging
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "1"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: falsify
+          # Replaced by deploy.sh with an image DIGEST. Never deployed by tag.
+          image: PLACEHOLDER
+          ports:
+            - containerPort: 8080
+          env:
+            - name: FALSIFY_ENV
+              value: staging
+            - name: FALSIFY_DB
+              value: /data/falsify.db
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi

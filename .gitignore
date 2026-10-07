@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------------------
+# Evaluation integrity: the Falsifier reads this repository. Anything that
+# would tell it where the seeded defects are must never be committed.
+# See planning/README.md and docs/PRD.md section 12.
+# ---------------------------------------------------------------------------
+planning/
+evaluation/measurements/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local app state
+*.db
+*.sqlite
+*.sqlite3
+falsify.db
+
+# Pipeline artifacts produced locally
+experiments.json
+live.json
+watch.json
+certificate.md
+.falsify/runs/
+
+# Secrets — nothing in this project should need one, by design
+.env
+.env.*
+!.env.example
+*.pem
+*-key.json
+service-account*.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Video working files (large)
+video/raw/
+video/*.mov
+video/*.mp4

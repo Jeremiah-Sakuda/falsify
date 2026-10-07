@@ -1,0 +1,55 @@
+# Plan flow — rewrites an issue's acceptance criteria as falsifiable claims.
+#
+# SCHEMA NOT YET VALIDATED. Written against the Flow Registry Framework v1 as
+# documented, but the exact key names and the Human Input component shape are
+# Oct 9 questions (see planning/oct-9-questions.md, Q1). Treat every field
+# below as a proposal until a trivial flow has actually run in the group.
+#
+# Trigger: mention. A trigger must be performed by a human user — a flow, bot,
+# or service account cannot fire one.
+
+version: v1
+name: falsify-plan
+description: >
+  Rewrite an issue's acceptance criteria as numbered, versioned falsifiable
+  claims. Bounce any criterion with no testable condition, with the one
+  question needed to make it testable. Never invent a number; ask for it.
+
+triggers:
+  - type: mention
+    on: issue
+
+inputs:
+  issue_iid:
+    type: string
+    from: trigger.issue.iid
+
+components:
+  - id: planner
+    type: agent
+    toolset:
+      - gitlab.issue.read
+      - gitlab.repository.files.read
+      - gitlab.issue.comment.create
+    prompt_file: ../../../.falsify/prompts/planner.md
+    output_schema:
+      claims_version: string          # "v1", "v2", ...
+      claims:
+        - id: string                  # C1, C2, ...
+          criterion: string           # the original text
+          condition: string           # the testable condition, with a number
+      bounced:
+        - criterion: string
+          question: string            # the ONE question needed to fix it
+
+outputs:
+  comment:
+    component: planner
+    template: ../../../.falsify/templates/claims_comment.md
+
+# Gate 1 is NOT in this flow. The flow posts and exits. The human posts
+# `falsify: claims approved v<N>` as an issue comment, and the certificate job
+# on a later MR pipeline is what reads and verifies that authorization.
+#
+# The label `falsify::claims-approved` is applied for visibility only and
+# carries no authority — no label-change trigger is documented.

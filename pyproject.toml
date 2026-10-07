@@ -1,0 +1,26 @@
+[project]
+name = "falsify"
+version = "0.1.0"
+description = "No red test, no accusation. An AI code reviewer that must bring evidence."
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --timeout=30"
+timeout = 30
+markers = [
+    "promoted: a regression test promoted from an experiment by the promote job",
+    "control: a negative test proving a security control fails closed",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["*/tests/*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

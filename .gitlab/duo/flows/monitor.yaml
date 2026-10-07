@@ -1,0 +1,63 @@
+# Monitor flow — reads the prod-watch artifact and files at most ONE
+# operational motion as a GitLab incident.
+#
+# SCHEMA NOT YET VALIDATED. See planning/oct-9-questions.md, Q1 and Q5.
+#
+# Trigger: mention, after the production deploy. The human mentions this
+# flow's service account on the MR.
+
+version: v1
+name: falsify-monitor
+description: >
+  Read the production watch window and file at most one operational motion.
+  A motion is an observation in a window, not proof the merge request caused
+  it, and the incident text must say so.
+
+triggers:
+  - type: mention
+    on: merge_request
+
+inputs:
+  mr_iid:
+    type: string
+    from: trigger.merge_request.iid
+
+components:
+  - id: monitor
+    type: agent
+    prompt_file: ../../../.falsify/prompts/monitor.md
+    inputs:
+      watch: artifact("prod-watch", "watch.json")
+      thresholds: file(".falsify/thresholds.yaml")
+      certificate: file("ledger/mr-${mr_iid}/certificate.md")
+    toolset:
+      - gitlab.pipeline.read
+      - gitlab.artifact.read
+      - gitlab.repository.files.read
+      - gitlab.incident.create
+      - gitlab.merge_request.comment.create
+    constraints:
+      max_motions: 1
+    output_schema:
+      motion:
+        metric: string                # error_rate | p95_latency_ms
+        threshold: number             # from .falsify/thresholds.yaml
+        observed: number
+        revision_digest: string       # must match events.md
+        request_ids: [string]         # the requests that reproduced it
+        recommendation: string        # rollback | monitor | deny
+        caveat: string                # the not-proof-of-cause language
+
+outputs:
+  incident:
+    component: monitor
+    template: ../../../.falsify/templates/motion_incident.md
+    links:
+      - merge_request: "${mr_iid}"
+      - certificate: "ledger/mr-${mr_iid}/certificate.md"
+
+# Gate 4 (cont.) is NOT in this flow. The human replies `falsify: rollback`
+# (runs the rollback job) or `falsify: deny` (recorded; incident closed).
+#
+# An MCP server exposing Cloud Run metrics is an optional upgrade. The
+# artifact path is the dependable one and was always the primary — see Q5.

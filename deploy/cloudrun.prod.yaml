@@ -1,0 +1,37 @@
+# Production. min instances 1 so a judge who clicks the submitted URL gets an
+# immediate answer; max instances 1 because the demo database is a SQLite file
+# on the instance filesystem, which is instance-local and ephemeral.
+#
+# Stays live through the winners' announcement (around Nov 16, 2026).
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: falsify-prod
+  labels:
+    falsify-environment: production
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "1"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - name: falsify
+          # Replaced by deploy.sh with an image DIGEST. Never deployed by tag.
+          image: PLACEHOLDER
+          ports:
+            - containerPort: 8080
+          env:
+            - name: FALSIFY_ENV
+              value: production
+            - name: FALSIFY_DB
+              value: /data/falsify.db
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
